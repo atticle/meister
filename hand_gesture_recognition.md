@@ -1243,6 +1243,8 @@ BGR -> RGB 변환 후 읽기 전용으로 표시하여 MediaPipe에 전달한다
 
 ### 12.11 최종 렌더링
 
+앞서 소개한 양손 동작 인식을 프로젝트에 응용하기 위한 클래스 버전으로, 이를 이용하면 다양한 프로젝트에 양손 동작 인식을 적용할 수 있다.
+
 ```python
     flick_cooldown = max(0, flick_cooldown - 1)
     if gesture_timer > 0:
@@ -1273,6 +1275,328 @@ BGR -> RGB 변환 후 읽기 전용으로 표시하여 MediaPipe에 전달한다
 매 프레임마다 쿨다운과 제스처 타이머를 1씩 감소시킨다. 그 후 스무딩된 상태값으로 회전 사각형을 그리고, 제스처가 감지된 상태(`gesture_timer > 0`)라면 화면 하단에 텍스트를 표시한다.
 
 ---
+
+## 13. 응용 코드
+
+
+```python
+import sys
+import cv2
+import mediapipe as mp
+import math
+import os
+import numpy as np
+import time
+from typing import Callable, Dict, Optional, Tuple
+
+BaseOptions = mp.tasks.BaseOptions
+HandLandmarker = mp.tasks.vision.HandLandmarker
+HandLandmarkerOptions = mp.tasks.vision.HandLandmarkerOptions
+VisionRunningMode = mp.tasks.vision.RunningMode
+
+
+class HandGestureController:
+    def __init__(self, model_path: Optional[str] = None, camera_index: int = 0):
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        self.model_path = model_path or os.path.join(current_dir, "hand_landmarker.task")
+        self.camera_index = camera_index
+
+        self.callbacks: Dict[str, Optional[Callable]] = {
+            "on_scale_up": None,
+            "on_scale_down": None,
+            "on_rotate": None,
+            "on_left_angle_with_right_fixed": None,
+        }
+
+        self.base_hand_dist: Optional[float] = None
+        self.base_hand_angle: Optional[float] = None
+        self.base_box_size = 80.0
+
+        self.smooth_points = {"Left": None, "Right": None}
+        self.smooth_center = [320.0, 240.0]
+        self.smooth_size = 80.0
+        self.smooth_angle = 0.0
+
+        self.last_scale_event = 1.0
+        self.last_rotation_event = 0.0
+        self.right_still_frames = 0
+        self.is_right_fixed = False
+        self.last_left_angle_event: Optional[float] = None
+
+        self.scale_event_threshold = 0.03
+        self.rotate_event_threshold = 1.5
+        self.right_fixed_speed_threshold = 2.0
+        self.right_fixed_frame_count = 6
+
+    def set_callback(self, event_name: str, callback: Callable):
+        if event_name not in self.callbacks:
+            raise ValueError(f"Unsupported event name: {event_name}")
+        self.callbacks[event_name] = callback
+
+    def _emit(self, event_name: str, *args):
+        callback = self.callbacks.get(event_name)
+        if callback is not None:
+            callback(*args)
+
+    def _create_options(self) -> HandLandmarkerOptions:
+        return HandLandmarkerOptions(
+            base_options=BaseOptions(
+                model_asset_path=self.model_path,
+                delegate=mp.tasks.BaseOptions.Delegate.CPU,
+            ),
+            running_mode=VisionRunningMode.VIDEO,
+            num_hands=2,
+            min_hand_detection_confidence=0.3,
+            min_hand_presence_confidence=0.3,
+            min_tracking_confidence=0.3,
+        )
+
+    def _extract_handed_points(self, detection_result, width: int, height: int) -> Dict[str, Tuple[float, float]]:
+        points: Dict[str, Tuple[float, float]] = {}
+        hand_landmarks = detection_result.hand_landmarks
+        handedness = detection_result.handedness
+
+        for idx, landmarks in enumerate(hand_landmarks):
+            if idx >= len(handedness) or not handedness[idx]:
+                continue
+            label = handedness[idx][0].category_name
+            if label not in ("Left", "Right"):
+                continue
+
+            center_x = float(landmarks[9].x * width)
+            center_y = float(landmarks[9].y * height)
+            points[label] = (center_x, center_y)
+
+        return points
+
+    def _smooth_point(self, label: str, raw_x: float, raw_y: float) -> Tuple[float, float, float]:
+        smooth_point = self.smooth_points[label]
+        if smooth_point is None:
+            self.smooth_points[label] = [raw_x, raw_y]
+            return raw_x, raw_y, 0.5
+
+        speed = math.hypot(raw_x - smooth_point[0], raw_y - smooth_point[1])
+        if speed < 2.5:
+            speed = 0.0
+
+        alpha = min(max(0.12 + speed / 25.0, 0.12), 0.95)
+        smooth_point[0] += (raw_x - smooth_point[0]) * alpha
+        smooth_point[1] += (raw_y - smooth_point[1]) * alpha
+        return smooth_point[0], smooth_point[1], alpha
+
+    def _reset_two_hand_state(self):
+        self.base_hand_dist = None
+        self.base_hand_angle = None
+        self.smooth_points["Left"] = None
+        self.smooth_points["Right"] = None
+        self.last_scale_event = 1.0
+        self.last_rotation_event = 0.0
+        self.right_still_frames = 0
+        self.is_right_fixed = False
+        self.last_left_angle_event = None
+
+    def _dispatch_events(
+        self,
+        scale_factor: float,
+        target_angle: float,
+        smooth_left: Tuple[float, float],
+        smooth_right: Tuple[float, float],
+        right_speed: float,
+    ):
+        if (
+            scale_factor >= 1.0 + self.scale_event_threshold
+            and abs(scale_factor - self.last_scale_event) >= self.scale_event_threshold
+        ):
+            self._emit("on_scale_up", scale_factor)
+            self.last_scale_event = scale_factor
+        elif (
+            scale_factor <= 1.0 - self.scale_event_threshold
+            and abs(scale_factor - self.last_scale_event) >= self.scale_event_threshold
+        ):
+            self._emit("on_scale_down", scale_factor)
+            self.last_scale_event = scale_factor
+
+        rotate_delta = target_angle - self.last_rotation_event
+        rotate_delta = (rotate_delta + 180) % 360 - 180
+        if abs(rotate_delta) >= self.rotate_event_threshold:
+            self._emit("on_rotate", target_angle)
+            self.last_rotation_event = target_angle
+
+        if right_speed < self.right_fixed_speed_threshold:
+            self.right_still_frames += 1
+        else:
+            self.right_still_frames = 0
+            self.is_right_fixed = False
+            self.last_left_angle_event = None
+
+        if self.right_still_frames >= self.right_fixed_frame_count:
+            self.is_right_fixed = True
+
+        if self.is_right_fixed:
+            left_angle = math.degrees(math.atan2(smooth_left[1] - smooth_right[1], smooth_left[0] - smooth_right[0]))
+            if self.last_left_angle_event is None:
+                self._emit("on_left_angle_with_right_fixed", left_angle)
+                self.last_left_angle_event = left_angle
+            else:
+                left_angle_diff = (left_angle - self.last_left_angle_event + 180) % 360 - 180
+                if abs(left_angle_diff) >= self.rotate_event_threshold:
+                    self._emit("on_left_angle_with_right_fixed", left_angle)
+                    self.last_left_angle_event = left_angle
+
+    def run(self):
+        options = self._create_options()
+
+        print("[SYSTEM] 카메라 초기화 중...")
+        if sys.platform == "win32":
+            cap = cv2.VideoCapture(self.camera_index, cv2.CAP_DSHOW)
+        else:
+            cap = cv2.VideoCapture(self.camera_index)
+
+        if not cap.isOpened():
+            print("[ERROR] 카메라를 열 수 없습니다.")
+            return
+
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        if sys.platform != "win32":
+            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+            cap.set(cv2.CAP_PROP_FPS, 30)
+
+        cam_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        cam_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        self.smooth_center = [cam_w / 2.0, cam_h / 2.0]
+        print(f"[SYSTEM] 캡처 해상도: {cam_w}x{cam_h}")
+
+        h, w = cam_h, cam_w
+        start_time = time.time()
+        prev_frame_time = start_time
+        fps_display = 0.0
+
+        print("[SYSTEM] AI 모델 로드 중 (VIDEO 모드 순차 동기화 엄격 적용)...")
+        with HandLandmarker.create_from_options(options) as landmarker:
+            print("[SYSTEM] 미디어파이프 양손 제어 시스템 실행.")
+
+            while cap.isOpened():
+                ret, frame = cap.read()
+                if not ret:
+                    break
+
+                frame = cv2.flip(frame, 1)
+                now = time.time()
+                elapsed = now - prev_frame_time
+                prev_frame_time = now
+                if elapsed > 0:
+                    fps_display = fps_display * 0.9 + (1.0 / elapsed) * 0.1
+
+                frame_timestamp_ms = int((now - start_time) * 1000)
+
+                rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                rgb_frame.flags.writeable = False
+                mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
+
+                detection_result = landmarker.detect_for_video(mp_image, frame_timestamp_ms)
+                handed_points = self._extract_handed_points(detection_result, w, h)
+
+                if "Left" in handed_points and "Right" in handed_points:
+                    left_raw = handed_points["Left"]
+                    right_raw = handed_points["Right"]
+
+                    left_x, left_y, alpha_left = self._smooth_point("Left", left_raw[0], left_raw[1])
+                    right_x, right_y, alpha_right = self._smooth_point("Right", right_raw[0], right_raw[1])
+
+                    shlx, shly = int(left_x), int(left_y)
+                    shrx, shry = int(right_x), int(right_y)
+                    cv2.circle(frame, (shlx, shly), 10, (255, 0, 0), -1)
+                    cv2.circle(frame, (shrx, shry), 10, (0, 0, 255), -1)
+                    cv2.line(frame, (shlx, shly), (shrx, shry), (255, 255, 255), 2)
+
+                    box_alpha = (alpha_left + alpha_right) / 2
+                    mid_x = (left_x + right_x) / 2
+                    mid_y = (left_y + right_y) / 2
+                    self.smooth_center[0] += (mid_x - self.smooth_center[0]) * box_alpha
+                    self.smooth_center[1] += (mid_y - self.smooth_center[1]) * box_alpha
+
+                    current_hand_dist = math.hypot(left_x - right_x, left_y - right_y)
+                    current_hand_angle = math.degrees(math.atan2(left_y - right_y, left_x - right_x))
+
+                    if self.base_hand_dist is None or self.base_hand_angle is None:
+                        self.base_hand_dist = current_hand_dist
+                        self.base_hand_angle = current_hand_angle
+                        self.base_box_size = self.smooth_size
+                    else:
+                        scale_factor = current_hand_dist / (self.base_hand_dist + 1e-6)
+                        target_size = min(max(self.base_box_size * scale_factor, 20), 200)
+                        self.smooth_size += (target_size - self.smooth_size) * box_alpha
+
+                        target_angle = current_hand_angle - self.base_hand_angle
+                        angle_diff = (target_angle - self.smooth_angle + 180) % 360 - 180
+                        self.smooth_angle += angle_diff * box_alpha
+
+                        right_speed = math.hypot(right_raw[0] - right_x, right_raw[1] - right_y)
+                        self._dispatch_events(
+                            scale_factor=scale_factor,
+                            target_angle=target_angle,
+                            smooth_left=(left_x, left_y),
+                            smooth_right=(right_x, right_y),
+                            right_speed=right_speed,
+                        )
+
+                    cv2.putText(
+                        frame,
+                        "SPATIAL CONTROL ACTIVE",
+                        (30, 50),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.7,
+                        (0, 255, 0),
+                        2,
+                    )
+                else:
+                    self._reset_two_hand_state()
+
+                rect = (
+                    (self.smooth_center[0], self.smooth_center[1]),
+                    (self.smooth_size * 2, self.smooth_size * 2),
+                    self.smooth_angle,
+                )
+                box_points = cv2.boxPoints(rect)
+                box_points = np.int32(box_points)
+                cv2.drawContours(frame, [box_points], 0, (0, 255, 255), 3)
+
+                cv2.putText(
+                    frame,
+                    f"FPS: {fps_display:.1f}",
+                    (cam_w - 130, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.7,
+                    (0, 255, 255),
+                    2,
+                )
+
+                cv2.imshow("Minority Report - Spatial UI", frame)
+                if cv2.waitKey(1) & 0xFF == ord("q"):
+                    break
+
+        cap.release()
+        cv2.destroyAllWindows()
+
+
+def main():
+    controller = HandGestureController()
+
+    controller.set_callback("on_scale_up", lambda scale: print(f"[EVENT] SCALE_UP: {scale:.3f}"))
+    controller.set_callback("on_scale_down", lambda scale: print(f"[EVENT] SCALE_DOWN: {scale:.3f}"))
+    controller.set_callback("on_rotate", lambda angle: print(f"[EVENT] ROTATE: {angle:.2f} deg"))
+    controller.set_callback(
+        "on_left_angle_with_right_fixed",
+        lambda angle: print(f"[EVENT] LEFT_ANGLE_WHEN_RIGHT_FIXED: {angle:.2f} deg"),
+    )
+
+    controller.run()
+
+
+if __name__ == "__main__":
+    main()
+```
 
 ## 부록 A. MediaPipe 랜드마크 심화
 
